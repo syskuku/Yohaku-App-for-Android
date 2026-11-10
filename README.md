@@ -101,6 +101,16 @@ scheme、站点域名的 https 深链、图标和权限都写进去，所以**�
 `signingConfigs.release` 指向 debug keystore；正式发布请换成自己的 keystore，
 并保管好 `*.jks`（已在 `.gitignore` 中忽略）。
 
+### 可选：构建参数
+
+| 环境变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `YOHAKU_ANDROID_ABIS` | 打进 APK 的 ABI 集合 | `arm64-v8a,x86_64` |
+| `YOHAKU_CMAKE_STAGING` | CMake 中间目录（Windows 路径过长时改这个） | `android/.cxx-staging` |
+
+只想发到应用商店、要兼容老设备时，加上 `armeabi-v7a`：
+`YOHAKU_ANDROID_ABIS=armeabi-v7a,arm64-v8a,x86_64 ./gradlew :app:assembleRelease`
+
 也可以直接用 EAS：
 
 ```bash
