@@ -1,0 +1,10 @@
+{
+  "appName": "Yohaku",
+  "androidPackage": "dev.yohaku.android",
+  "bundleId": "dev.yohaku.app",
+  "scheme": "yohaku",
+  "siteUrl": "https://example.com",
+  "apiUrl": "https://example.com/api/v3",
+  "privacyUrl": "",
+  "siteHosts": ["example.com"]
+}

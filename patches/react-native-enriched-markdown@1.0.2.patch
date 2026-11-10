@@ -1,0 +1,375 @@
+diff --git a/ios/views/ENRMCodeBlockContainerView.m b/ios/views/ENRMCodeBlockContainerView.m
+--- a/ios/views/ENRMCodeBlockContainerView.m
++++ b/ios/views/ENRMCodeBlockContainerView.m
+@@ -293,11 +293,21 @@
+ // top inset then forms the single gap below the label.
+ - (CGFloat)headerHeight
+ {
++  // Yohaku patch: comments render fenced code without a language most of the
++  // time; drop the whole header strip (label + copy button) in that case.
++  if (_displayLanguage.length == 0) {
++    return 0;
++  }
+   return [self contentInset] + _headerLabelLineHeight;
+ }
+ 
+ - (void)layoutHeaderButton
+ {
++  BOOL headerHidden = _displayLanguage.length == 0;
++  _copyButton.hidden = headerHidden;
++  if (headerHidden) {
++    return;
++  }
+   CGFloat headerH = [self headerHeight];
+   CGFloat iconWidth = _copyButton.intrinsicContentSize.width;
+   if (iconWidth <= 0 || iconWidth > headerH) {
+@@ -412,7 +422,9 @@
+ + (CGFloat)measureHeightForCodeBlockNode:(MarkdownASTNode *)node config:(StyleConfig *)config
+ {
+   CGFloat inset = ENRMCodeBlockContentInset(config);
+-  CGFloat headerH = inset + ENRMCodeBlockHeaderLabelLineHeight(ENRMCodeBlockHeaderFont(config));
++  // Yohaku patch: mirror headerHeight — no language, no header strip.
++  BOOL hasLanguage = ENRMCodeBlockDisplayLanguageName(ENRMCodeBlockLanguage(node)).length > 0;
++  CGFloat headerH = hasLanguage ? inset + ENRMCodeBlockHeaderLabelLineHeight(ENRMCodeBlockHeaderFont(config)) : 0;
+   NSAttributedString *code = ENRMCodeBlockPlainAttributedCode(ENRMCodeBlockExtractCode(node), config);
+   return ENRMCodeBlockCodeSize(code).height + inset * 2 + headerH;
+ }
+@@ -449,7 +461,7 @@
+   // Divider between the header and the code, centered in the gap the code
+   // text's top inset creates, so it adds no height of its own.
+   RCTUIColor *dividerColor = [[_config codeBlockColor] colorWithAlphaComponent:kENRMHeaderDividerAlpha];
+-  if (dividerColor) {
++  if (dividerColor && headerH > 0) {
+     CGRect dividerRect = CGRectMake(borderWidth, headerH + inset / 2, self.bounds.size.width - borderWidth * 2, 1);
+     [dividerColor setFill];
+ #if !TARGET_OS_OSX
+diff --git a/ios/views/ENRMTableIOSGridView.m b/ios/views/ENRMTableIOSGridView.m
+--- a/ios/views/ENRMTableIOSGridView.m
++++ b/ios/views/ENRMTableIOSGridView.m
+@@ -69,6 +69,16 @@
+ 
+ #pragma mark - Drawing
+ 
++// Yohaku patch: row separators are the border color at reduced alpha, so a
++// single `borderColor` still drives both the heavy and the hairline rule.
++static const CGFloat kENRMTableHairlineAlpha = 0.32;
++
++static void ENRMTableDrawRule(CGFloat y, CGFloat width, CGFloat thickness, UIColor *color)
++{
++  [color setFill];
++  UIRectFill(CGRectMake(0, y, width, thickness));
++}
++
+ - (void)drawRect:(CGRect)dirtyRect
+ {
+   if (!_tableRows.count || !_columnWidths.count || !_rowHeights.count)
+@@ -88,11 +98,6 @@
+       [rowData.backgroundColor setFill];
+       UIRectFill(cellRect);
+ 
+-      [_borderColor setStroke];
+-      UIBezierPath *border = [UIBezierPath bezierPathWithRect:cellRect];
+-      border.lineWidth = _borderWidth;
+-      [border stroke];
+-
+       NSAttributedString *text = rowData.cellTexts[c];
+       if (text.length > 0) {
+         CGRect textRect = CGRectMake(xOffset + _horizontalCellPadding, yOffset + _verticalCellPadding,
+@@ -106,8 +111,38 @@
+     }
+     yOffset += rowHeight;
+   }
++
++  [self drawHorizontalRules];
+ }
+ 
++// Yohaku patch: 三线表 — the table is set as printed type, not as a grid. No
++// vertical rules at all; a heavy rule opens and closes the block, a hairline
++// separates the header and each body row.
++- (void)drawHorizontalRules
++{
++  CGFloat totalWidth = 0;
++  for (NSNumber *width in _columnWidths) {
++    totalWidth += width.doubleValue;
++  }
++  if (totalWidth <= 0 || !_borderColor)
++    return;
++
++  UIColor *hairline = [_borderColor colorWithAlphaComponent:kENRMTableHairlineAlpha];
++  CGFloat strongWidth = _borderWidth * 2;
++
++  CGFloat y = 0;
++  ENRMTableDrawRule(0, totalWidth, strongWidth, _borderColor);
++  for (NSUInteger r = 0; r < _rowHeights.count; r++) {
++    y += [_rowHeights[r] doubleValue];
++    BOOL isLast = (r == _rowHeights.count - 1);
++    if (isLast) {
++      ENRMTableDrawRule(y - strongWidth, totalWidth, strongWidth, _borderColor);
++    } else {
++      ENRMTableDrawRule(y, totalWidth, _borderWidth, hairline);
++    }
++  }
++}
++
+ #pragma mark - Link hit-testing
+ 
+ - (BOOL)cellAtPoint:(CGPoint)point
+diff --git a/ios/views/TableContainerView.m b/ios/views/TableContainerView.m
+--- a/ios/views/TableContainerView.m
++++ b/ios/views/TableContainerView.m
+@@ -53,15 +53,28 @@
+   return [buffer copy];
+ }
+ 
++// Yohaku patch: header label metrics, derived from the table font so a single
++// `fontSize` still drives the whole table.
++static const CGFloat kENRMTableHeaderFontScale = 0.78;
++static const CGFloat kENRMTableHeaderMinFontSize = 10.0;
++static const CGFloat kENRMTableHeaderKernRatio = 0.16;
++
++static CGFloat ENRMTableHeaderFontSize(StyleConfig *config)
++{
++  return MAX(config.tableFontSize * kENRMTableHeaderFontScale, kENRMTableHeaderMinFontSize);
++}
++
+ static StyleConfig *ENRMTableCellConfig(StyleConfig *config, BOOL isHeader)
+ {
+   StyleConfig *cellConfig = [config copy];
+ 
+-  [cellConfig setParagraphFontSize:config.tableFontSize];
++  // Yohaku patch: the header is a typographic label, not a bold copy of the
++  // body — smaller, medium weight, wide-tracked (kern applied at render time).
++  [cellConfig setParagraphFontSize:isHeader ? ENRMTableHeaderFontSize(config) : config.tableFontSize];
+   NSString *headerFamily =
+       config.tableHeaderFontFamily.length > 0 ? config.tableHeaderFontFamily : config.tableFontFamily;
+   [cellConfig setParagraphFontFamily:isHeader ? headerFamily : config.tableFontFamily];
+-  [cellConfig setParagraphFontWeight:isHeader ? @"bold" : config.tableFontWeight];
++  [cellConfig setParagraphFontWeight:isHeader ? @"medium" : config.tableFontWeight];
+   [cellConfig setParagraphColor:isHeader ? config.tableHeaderTextColor : config.tableColor];
+   [cellConfig setParagraphLineHeight:config.tableLineHeight];
+ 
+@@ -141,6 +154,14 @@
+         cell.attributedText =
+             ENRMTableRenderCellNode(cellNode, cellConfig, cell.alignment, allowFontScaling, maxFontSizeMultiplier,
+                                     writingDirectionMode, resolvedLayoutDirection);
++        // Yohaku patch: track the header out; CJK headers get the same airing
++        // as Latin ones, which is what reads as a printed label.
++        if (cell.isHeader && cell.attributedText.length > 0) {
++          CGFloat kern = ENRMTableHeaderFontSize(config) * kENRMTableHeaderKernRatio;
++          [cell.attributedText addAttribute:NSKernAttributeName
++                                      value:@(kern)
++                                      range:NSMakeRange(0, cell.attributedText.length)];
++        }
+         [rowCells addObject:cell];
+       }
+       colCount = MAX(colCount, rowCells.count);
+diff --git a/cpp/parser/MD4CParser.cpp b/cpp/parser/MD4CParser.cpp
+index 4653212..36d1127 100644
+--- a/cpp/parser/MD4CParser.cpp
++++ b/cpp/parser/MD4CParser.cpp
+@@ -1,10 +1,56 @@
+ #include "MD4CParser.hpp"
+ #include "../md4c/md4c.h"
++#include <cstdlib>
+ #include <cstring>
+ #include <vector>
+ 
+ namespace Markdown {
+ 
++namespace {
++
++void appendUtf8(std::string &out, unsigned long codePoint) {
++  if (codePoint < 0x80) {
++    out += static_cast<char>(codePoint);
++  } else if (codePoint < 0x800) {
++    out += static_cast<char>(0xC0 | (codePoint >> 6));
++    out += static_cast<char>(0x80 | (codePoint & 0x3F));
++  } else if (codePoint < 0x10000) {
++    out += static_cast<char>(0xE0 | (codePoint >> 12));
++    out += static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F));
++    out += static_cast<char>(0x80 | (codePoint & 0x3F));
++  } else {
++    out += static_cast<char>(0xF0 | (codePoint >> 18));
++    out += static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F));
++    out += static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F));
++    out += static_cast<char>(0x80 | (codePoint & 0x3F));
++  }
++}
++
++void appendEntity(std::string &out, const char *text, size_t size) {
++  std::string entity(text, size);
++  if (size > 3 && entity[1] == '#') {
++    bool hex = entity[2] == 'x' || entity[2] == 'X';
++    char *end = nullptr;
++    unsigned long codePoint = std::strtoul(entity.c_str() + (hex ? 3 : 2), &end, hex ? 16 : 10);
++    if (end && *end == ';' && codePoint > 0 && codePoint <= 0x10FFFF) {
++      appendUtf8(out, codePoint);
++      return;
++    }
++  }
++  static const char *const named[][2] = {
++      {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}, {"&nbsp;", "\xC2\xA0"},
++  };
++  for (const auto &pair : named) {
++    if (entity == pair[0]) {
++      out += pair[1];
++      return;
++    }
++  }
++  out += entity;
++}
++
++} // namespace
++
+ class MD4CParser::Impl {
+ public:
+   std::shared_ptr<MarkdownASTNode> root;
+@@ -364,6 +410,11 @@ public:
+       return 0;
+     }
+ 
++    if (type == MD_TEXT_ENTITY) {
++      appendEntity(impl->currentText, text, size);
++      return 0;
++    }
++
+     // Handle text content (normal text, code text, LaTeX math, etc.)
+     if (type == MD_TEXT_NORMAL || type == MD_TEXT_CODE || type == MD_TEXT_LATEXMATH) {
+       impl->currentText.append(text, size);
+diff --git a/ios/parser/ENRMMarkdownASTExport.h b/ios/parser/ENRMMarkdownASTExport.h
+new file mode 100644
+index 0000000..ab197b7
+--- /dev/null
++++ b/ios/parser/ENRMMarkdownASTExport.h
+@@ -0,0 +1,7 @@
++#import <Foundation/Foundation.h>
++
++@interface ENRMMarkdownASTExport : NSObject
++
+++ (NSString *)jsonForMarkdown:(NSString *)markdown;
++
++@end
+diff --git a/ios/parser/ENRMMarkdownASTExport.mm b/ios/parser/ENRMMarkdownASTExport.mm
+new file mode 100644
+index 0000000..156cd7c
+--- /dev/null
++++ b/ios/parser/ENRMMarkdownASTExport.mm
+@@ -0,0 +1,118 @@
++#import "ENRMMarkdownASTExport.h"
++#include "MD4CParser.hpp"
++#include "MarkdownASTNode.hpp"
++
++static NSString *ENRMNodeTypeName(Markdown::NodeType type)
++{
++  switch (type) {
++    case Markdown::NodeType::Document:
++      return @"document";
++    case Markdown::NodeType::Paragraph:
++      return @"paragraph";
++    case Markdown::NodeType::Text:
++      return @"text";
++    case Markdown::NodeType::Link:
++      return @"link";
++    case Markdown::NodeType::Heading:
++      return @"heading";
++    case Markdown::NodeType::LineBreak:
++      return @"lineBreak";
++    case Markdown::NodeType::Strong:
++      return @"strong";
++    case Markdown::NodeType::Emphasis:
++      return @"emphasis";
++    case Markdown::NodeType::Strikethrough:
++      return @"strikethrough";
++    case Markdown::NodeType::Underline:
++      return @"underline";
++    case Markdown::NodeType::Code:
++      return @"code";
++    case Markdown::NodeType::Image:
++      return @"image";
++    case Markdown::NodeType::Blockquote:
++      return @"blockquote";
++    case Markdown::NodeType::UnorderedList:
++      return @"unorderedList";
++    case Markdown::NodeType::OrderedList:
++      return @"orderedList";
++    case Markdown::NodeType::ListItem:
++      return @"listItem";
++    case Markdown::NodeType::CodeBlock:
++      return @"codeBlock";
++    case Markdown::NodeType::ThematicBreak:
++      return @"thematicBreak";
++    case Markdown::NodeType::Table:
++      return @"table";
++    case Markdown::NodeType::TableHead:
++      return @"tableHead";
++    case Markdown::NodeType::TableBody:
++      return @"tableBody";
++    case Markdown::NodeType::TableRow:
++      return @"tableRow";
++    case Markdown::NodeType::TableHeaderCell:
++      return @"tableHeaderCell";
++    case Markdown::NodeType::TableCell:
++      return @"tableCell";
++    case Markdown::NodeType::LatexMathInline:
++      return @"latexMathInline";
++    case Markdown::NodeType::LatexMathDisplay:
++      return @"latexMathDisplay";
++    case Markdown::NodeType::Spoiler:
++      return @"spoiler";
++    case Markdown::NodeType::Superscript:
++      return @"superscript";
++    case Markdown::NodeType::Subscript:
++      return @"subscript";
++    case Markdown::NodeType::Highlight:
++      return @"highlight";
++    case Markdown::NodeType::SoftBreak:
++      return @"softBreak";
++  }
++  return @"text";
++}
++
++static NSString *ENRMString(const std::string &value)
++{
++  return [NSString stringWithUTF8String:value.c_str()] ?: @"";
++}
++
++static NSDictionary *ENRMExportNode(const Markdown::MarkdownASTNode &node)
++{
++  NSMutableDictionary *out = [NSMutableDictionary dictionaryWithObject:ENRMNodeTypeName(node.type) forKey:@"type"];
++  if (!node.content.empty()) {
++    out[@"content"] = ENRMString(node.content);
++  }
++  if (!node.attributes.empty()) {
++    NSMutableDictionary *attributes = [NSMutableDictionary dictionaryWithCapacity:node.attributes.size()];
++    for (const auto &entry : node.attributes) {
++      attributes[ENRMString(entry.first)] = ENRMString(entry.second);
++    }
++    out[@"attributes"] = attributes;
++  }
++  if (!node.children.empty()) {
++    NSMutableArray *children = [NSMutableArray arrayWithCapacity:node.children.size()];
++    for (const auto &child : node.children) {
++      if (child) {
++        [children addObject:ENRMExportNode(*child)];
++      }
++    }
++    out[@"children"] = children;
++  }
++  return out;
++}
++
++@implementation ENRMMarkdownASTExport
++
+++ (NSString *)jsonForMarkdown:(NSString *)markdown
++{
++  const char *utf8 = markdown.UTF8String;
++  Markdown::Md4cFlags flags;
++  flags.highlight = true;
++  Markdown::MD4CParser parser;
++  auto root = parser.parse(utf8 ? std::string(utf8) : std::string(), flags);
++  NSData *data = root ? [NSJSONSerialization dataWithJSONObject:ENRMExportNode(*root) options:0 error:nil] : nil;
++  NSString *json = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
++  return json ?: @"{\"type\":\"document\"}";
++}
++
++@end

@@ -1,0 +1,470 @@
+import { and, eq } from 'drizzle-orm'
+import { Stack, useIsPreview } from 'expo-router'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ScrollViewInstance } from 'react-native'
+import { StyleSheet, View } from 'react-native'
+
+import { translatedBodyNeedsRefresh } from '@/api/article-meta'
+import { api } from '@/api/client'
+import { useSession } from '@/auth/session-store'
+import { duoArticleColumn } from '@/components/navigation/duo/readable'
+import { EdgeEffectScrollView } from '@/components/navigation/edge-effect-scroll-view'
+import { AppText } from '@/components/ui'
+import { db } from '@/db'
+import { posts } from '@/db/schema'
+import { useDatabaseSnapshot } from '@/db/use-database-snapshot'
+import { useLocale, useTranslations } from '@/i18n'
+import { recordReading } from '@/interactions/reading'
+import { estimateReadingMinutes } from '@/lib/article-reading-position'
+import { formatRelativeTime } from '@/lib/datetime'
+import { extractHeadings } from '@/lib/lexical-headings'
+import { openExternalUrl } from '@/lib/open-external'
+import { siteHref } from '@/lib/site-url'
+import { useOwner } from '@/owner/store'
+import { markdownArticle } from '@/rich/markdown/parse'
+import { markdownOpensOnWeb } from '@/rich/markdown/support'
+import { CommentComposeHost } from '@/screens/comments/comment-compose-provider'
+import {
+  useIsActiveMember,
+  useMembershipPlans,
+} from '@/screens/me/use-membership'
+import { refreshPostBody } from '@/sync/engine'
+import {
+  bodyIsStale,
+  calibratePostMeta,
+  decorationIsStale,
+  postBodyFromApi,
+  postMetaFromApi,
+} from '@/sync/merge'
+import { postBodyConflictSet } from '@/sync/upsert-sets'
+import { usePalette } from '@/theme/palette'
+import { TtsMiniBar } from '@/tts/tts-mini-bar'
+import { useTtsSession } from '@/tts/use-tts-session'
+
+import { ArticleBody } from './article-body'
+import { ArticleMore } from './article-more'
+import { ArticleNotice } from './article-notice'
+import { useArticlePrint } from './article-print-host'
+import { ArticleTail } from './article-tail'
+import { BodyLoadingIndicator, useReservedBodyHeight } from './body-slot'
+import { ArticleAside } from './duo/article-aside'
+import { ArticleDuoFrame } from './duo/article-duo-frame'
+import { useDuoArticle } from './duo/reading-store'
+import { PaywallGate } from './paywall-gate'
+import { PostDetailHeader } from './post-detail-header'
+import { shouldUnlockPaywalledContent } from './should-unlock-paywall'
+import { useCollapsingTitle } from './use-collapsing-title'
+import { useOpenArticleToc } from './use-open-article-toc'
+import { useReadingPresence } from './use-reading-presence'
+import { useRetryableBodyRefresh } from './use-retryable-body-refresh'
+
+export function PostDetailScreen({
+  categorySlug,
+  postId: routePostId,
+  slug,
+}: {
+  categorySlug: string
+  postId?: string
+  slug: string
+}) {
+  const isPreview = useIsPreview()
+  const locale = useLocale()
+  const t = useTranslations('detail')
+  const tc = useTranslations('common')
+  const tl = useTranslations('list')
+  const tt = useTranslations('tabs')
+  const tp = useTranslations('print')
+  const owner = useOwner()
+  const { host: printHost, print } = useArticlePrint()
+  const palette = usePalette()
+  const session = useSession()
+  const isMember = useIsActiveMember()
+  const { data: plans } = useMembershipPlans()
+  const reservedBodyHeight = useReservedBodyHeight()
+  const scrollRef = useRef<ScrollViewInstance>(null)
+  const unlockInflightRef = useRef(false)
+  const [failed, setFailed] = useState(false)
+  const [attempt, setAttempt] = useState(0)
+
+  const { snapshot, updatesEnabled } = useDatabaseSnapshot({
+    identity: `post:${locale}:${routePostId ?? ''}:${categorySlug}:${slug}`,
+    read: async () => {
+      const rows = await db
+        .select()
+        .from(posts)
+        .where(
+          routePostId
+            ? and(eq(posts.id, routePostId), eq(posts.lang, locale))
+            : and(
+                eq(posts.categorySlug, categorySlug),
+                eq(posts.slug, slug),
+                eq(posts.lang, locale),
+              ),
+        )
+        .limit(1)
+      return rows[0]
+    },
+    tables: ['posts'],
+  })
+  const post = snapshot ?? undefined
+  const postId = post?.id
+  const bodyVersion = post?.bodyVersion
+  const webOnly = markdownOpensOnWeb(post?.contentFormat)
+  const webUrl = siteHref(`/posts/${categorySlug}/${slug}`)
+  const locked = post?.articleMeta?.paywall?.locked === true
+  const isOwner = session?.role === 'owner'
+  const showPaywallGate = locked && !isMember && !isOwner
+  const shouldUnlock = shouldUnlockPaywalledContent({
+    isMember,
+    isOwner,
+    locked,
+  })
+
+  useEffect(() => {
+    if (isPreview || !postId || !updatesEnabled) return
+    void recordReading(db, { refId: postId, kind: 'post', lang: locale })
+  }, [isPreview, locale, postId, updatesEnabled])
+
+  useRetryableBodyRefresh({
+    enabled:
+      updatesEnabled &&
+      Boolean(post) &&
+      !webOnly &&
+      translatedBodyNeedsRefresh(post?.articleMeta),
+    refresh: async () => {
+      if (post) await refreshPostBody(post)
+    },
+    refreshKey: post
+      ? `post:${post.id}:${post.lang}`
+      : `post:${categorySlug}:${slug}:${locale}`,
+  })
+
+  useEffect(() => {
+    if (!updatesEnabled) return
+    let cancelled = false
+    const load = async () => {
+      if (markdownOpensOnWeb(post?.contentFormat)) return
+      if (post && !bodyIsStale(post)) {
+        if (decorationIsStale(post)) void refreshPostBody(post)
+        return
+      }
+      try {
+        if (post) {
+          await refreshPostBody(post)
+        } else {
+          const {
+            data: detail,
+            enrichments,
+            meta,
+          } = await api.postDetail(categorySlug, slug, locale, routePostId)
+          await db
+            .insert(posts)
+            .values({
+              ...calibratePostMeta(
+                undefined,
+                postMetaFromApi(detail, locale),
+              ),
+              ...postBodyFromApi(detail, enrichments, meta),
+            })
+            .onConflictDoUpdate({
+              target: [posts.id, posts.lang],
+              set: postBodyConflictSet,
+            })
+        }
+      } catch {
+        if (!cancelled) setFailed(true)
+      }
+    }
+    setFailed(false)
+    void load()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [postId, bodyVersion, categorySlug, slug, locale, attempt, updatesEnabled])
+
+  useEffect(() => {
+    if (updatesEnabled && !isPreview && webOnly) {
+      void openExternalUrl(webUrl)
+    }
+  }, [webOnly, isPreview, updatesEnabled, webUrl])
+
+  const postRef = useRef(post)
+  postRef.current = post
+
+  useEffect(() => {
+    const current = postRef.current
+    if (
+      !shouldUnlock ||
+      !current ||
+      !updatesEnabled ||
+      unlockInflightRef.current
+    ) {
+      return
+    }
+    unlockInflightRef.current = true
+    void refreshPostBody(current).finally(() => {
+      unlockInflightRef.current = false
+    })
+  }, [postId, shouldUnlock, updatesEnabled])
+
+  // Android renders posts from the markdown body the API always ships alongside
+  // the lexical document. The lexical renderer drops the entire document when it
+  // meets a node type it cannot build, which on device showed up as a completely
+  // blank article (the words line still rendered, the body did not). Markdown
+  // renders reliably, so it wins whenever the API has it; lexical is only the
+  // last resort for posts that have a lexical body but no markdown text.
+  const markdownSource =
+    post && post.bodyVersion !== null && post.text ? post.text : null
+  const body =
+    !markdownSource && post?.contentFormat === 'lexical' && post.content
+      ? post.content
+      : null
+  const markdown = useMemo(
+    () => (markdownSource ? markdownArticle(markdownSource) : null),
+    [markdownSource],
+  )
+  const headings = useMemo(
+    () => markdown?.headings ?? extractHeadings(body ?? ''),
+    [body, markdown],
+  )
+
+  const { marks, onScrollMetrics, presenceSnapshot, readerCount } =
+    useReadingPresence({
+      articleId: isPreview ? undefined : post?.id,
+      enabled: updatesEnabled,
+      openOnWeb: isPreview || webOnly,
+    })
+  const openToc = useOpenArticleToc(headings, presenceSnapshot)
+  const duo = useDuoArticle(onScrollMetrics)
+  const headerSubtitle = post?.categoryName ?? post?.tags[0] ?? tt('posts')
+  const { headerTitleProgress, headerOptions, onScroll, onTitleLayout } =
+    useCollapsingTitle(post?.title, headerSubtitle, duo.onScrollMetrics, marks, {
+      onTitlePress:
+        headings.length > 0 || readerCount > 0 ? openToc : undefined,
+      readerCount,
+    })
+  const tts = useTtsSession({
+    articleId: post?.id,
+    available: post?.articleMeta?.tts?.available === true,
+    lang: locale,
+    stale: post?.articleMeta?.tts?.stale === true,
+    title: post?.title,
+  })
+
+  const metaParts = post
+    ? [
+        formatRelativeTime(post.createdAt, locale),
+        post.text && post.bodyVersion !== null
+          ? tl('wordCount', { count: post.text.length })
+          : null,
+        post.likeCount > 0 ? `♡ ${post.likeCount}` : null,
+      ]
+    : []
+
+  return (
+    <View style={styles.screen}>
+      {printHost}
+      <Stack.Screen options={headerOptions} />
+      <ArticleMore
+        listenAvailable={tts.available}
+        listening={tts.isNarrating}
+        printAvailable={Boolean(body || markdown) && !showPaywallGate}
+        title={post?.title}
+        tocAvailable={headings.length > 0 && !duo.asideShown}
+        url={webUrl}
+        onListen={tts.start}
+        onToc={openToc}
+        onPrint={
+          post && (body || markdown)
+            ? () =>
+                print({
+                  category: post.categoryName ?? tt('posts'),
+                  content: body ?? '',
+                  markdown,
+                  createdAt: new Date(post.createdAt),
+                  siteName: owner?.name || tp('site'),
+                  title: post.title,
+                  url: webUrl,
+                  variant: 'article',
+                })
+            : undefined
+        }
+      />
+      {post ? (
+        <ArticleDuoFrame
+          asideAvailable={headings.length > 0}
+          aside={(mode) => (
+            <ArticleAside
+              eyebrow={post.categoryName}
+              headings={headings}
+              mode={mode}
+              reading={duo.reading}
+              summary={post.articleMeta?.summary}
+              title={post.title}
+              totalMinutes={estimateReadingMinutes(post.text?.length ?? 0)}
+            />
+          )}
+          onLayoutChange={duo.onLayoutChange}
+        >
+          {(column) => (
+            <CommentComposeHost
+              allowComment
+              refId={post.id}
+              refType="post"
+              scrollRef={scrollRef}
+            >
+              {(compose) => (
+                <>
+                  <EdgeEffectScrollView
+                    automaticallyAdjustKeyboardInsets={!compose.composing}
+                    headerTitleProgress={headerTitleProgress}
+                    ref={scrollRef}
+                    contentContainerStyle={[
+                      styles.content,
+                      column,
+                      tts.isNarrating && !compose.composing
+                        ? styles.narratingPad
+                        : null,
+                    ]}
+                    contentInset={
+                      compose.composing
+                        ? { bottom: compose.scrollBottomInset }
+                        : undefined
+                    }
+                    style={[
+                      styles.screen,
+                      { backgroundColor: palette.surface.desk },
+                    ]}
+                    onScroll={onScroll}
+                    onScrollBeginDrag={tts.onScrollBeginDrag}
+                  >
+                    <PostDetailHeader
+                      aiGen={post.articleMeta?.aiGen}
+                      categoryName={post.categoryName}
+                      categorySlug={post.categorySlug}
+                      metaParts={metaParts}
+                      tags={post.tags}
+                      title={post.title}
+                      onLayout={onTitleLayout}
+                    />
+                <ArticleNotice
+                  id={post.id}
+                  kind="post"
+                  meta={post.articleMeta}
+                  webUrl={webUrl}
+                  listen={{
+                    available: tts.available,
+                    current: tts.current,
+                    elapsed: tts.elapsed,
+                    status: tts.status,
+                    total: tts.total,
+                    onToggle: tts.toggle,
+                  }}
+                />
+                {webOnly || (markdownSource && !markdown) ? (
+                  <View style={{ minHeight: reservedBodyHeight }}>
+                    <AppText
+                      style={styles.placeholder}
+                      variant="secondary"
+                      onPress={() => void openExternalUrl(webUrl)}
+                    >
+                      {tc('openInBrowser')}
+                    </AppText>
+                  </View>
+                ) : body || markdown ? (
+                  <ArticleBody
+                    autoFollow={tts.autoFollow}
+                    content={body ?? ''}
+                    enrichments={post?.enrichments ?? null}
+                    fallbackText={post.text ?? null}
+                    highlightBlockId={tts.activeBlockId}
+                    markdown={markdown}
+                    queriesEnabled={updatesEnabled}
+                    refId={post.id}
+                    refType="post"
+                    scrollRef={scrollRef}
+                        variant="article"
+                    webUrl={webUrl}
+                  />
+                ) : showPaywallGate ? null : failed ? (
+                  <View style={{ minHeight: reservedBodyHeight }}>
+                    <AppText
+                      style={styles.placeholder}
+                      variant="secondary"
+                      onPress={() => setAttempt((n) => n + 1)}
+                    >
+                      {t('bodyFailed')}
+                    </AppText>
+                  </View>
+                ) : (
+                  <BodyLoadingIndicator minHeight={reservedBodyHeight} />
+                )}
+                <PaywallGate
+                  appleIapEnabled={plans?.appleIap?.enabled === true}
+                  loggedIn={Boolean(session)}
+                  visible={showPaywallGate}
+                />
+                    <ArticleTail
+                      kind="post"
+                      likeCount={post.likeCount}
+                      queriesEnabled={updatesEnabled}
+                      refId={post.id}
+                    />
+                  </EdgeEffectScrollView>
+                  {tts.isNarrating && !compose.composing ? (
+                    <TtsMiniBar
+                      autoFollow={tts.autoFollow}
+                      current={tts.current}
+                      duration={tts.duration}
+                      elapsed={tts.elapsed}
+                      playbackRate={tts.playbackRate}
+                      stale={tts.stale}
+                      status={tts.status}
+                      total={tts.total}
+                      onRecenter={tts.recenter}
+                      onSelectRate={tts.setRate}
+                      onStop={tts.stop}
+                      onToggle={tts.toggle}
+                    />
+                  ) : null}
+                </>
+              )}
+            </CommentComposeHost>
+          )}
+        </ArticleDuoFrame>
+      ) : (
+        <EdgeEffectScrollView
+          contentContainerStyle={[styles.content, duoArticleColumn]}
+          headerTitleProgress={headerTitleProgress}
+          ref={scrollRef}
+          style={[styles.screen, { backgroundColor: palette.surface.desk }]}
+          onScroll={onScroll}
+        >
+          <AppText style={styles.placeholder} variant="secondary">
+            {failed ? t('postFailed') : tc('loading')}
+          </AppText>
+        </EdgeEffectScrollView>
+      )}
+    </View>
+  )
+}
+
+const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+  },
+  content: {
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 48,
+    gap: 20,
+  },
+  narratingPad: {
+    paddingBottom: 108,
+  },
+  placeholder: {
+    marginTop: 32,
+    textAlign: 'center',
+  },
+})

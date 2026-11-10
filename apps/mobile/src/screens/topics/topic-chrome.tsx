@@ -1,0 +1,26 @@
+import { Toolbar } from '@/components/navigation/header-toolbar'
+import { Stack, useRouter } from 'expo-router'
+
+import { PaperNavigationControl } from '@/components/navigation/paper-navigation-control'
+import { usesPaperNavigationControls } from '@/components/navigation/platform'
+import { useTranslations } from '@/i18n'
+
+export function TopicBackControl() {
+  const router = useRouter()
+  const t = useTranslations('common')
+
+  if (usesPaperNavigationControls) {
+    return router.canGoBack() ? (
+      <Toolbar asChild placement="left">
+        <PaperNavigationControl
+          accessibilityLabel={t('back')}
+          icon="arrow.left"
+          identifier="topic-back"
+          onPress={() => router.back()}
+        />
+      </Toolbar>
+    ) : null
+  }
+
+  return null
+}

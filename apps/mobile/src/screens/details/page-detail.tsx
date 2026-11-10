@@ -1,0 +1,229 @@
+import { useQuery } from '@tanstack/react-query'
+import { Stack, useRouter } from 'expo-router'
+import type { ReactNode } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
+import type { ScrollViewInstance, StyleProp, ViewStyle } from 'react-native'
+import { Dimensions, StyleSheet, View } from 'react-native'
+
+import { api } from '@/api/client'
+import { duoArticleColumn } from '@/components/navigation/duo/readable'
+import { EdgeEffectScrollView } from '@/components/navigation/edge-effect-scroll-view'
+import { AppText } from '@/components/ui'
+import { useLocale, useTranslations } from '@/i18n'
+import { estimateReadingMinutes } from '@/lib/article-reading-position'
+import { presentArticleToc, tocHref } from '@/lib/article-toc'
+import { formatRelativeTime } from '@/lib/datetime'
+import { extractHeadings } from '@/lib/lexical-headings'
+import { openExternalUrl } from '@/lib/open-external'
+import { siteHref } from '@/lib/site-url'
+import { useOwner } from '@/owner/store'
+import { markdownArticle } from '@/rich/markdown/parse'
+import { markdownOpensOnWeb } from '@/rich/markdown/support'
+import { CommentComposeHost } from '@/screens/comments/comment-compose-provider'
+import { CommentSection } from '@/screens/comments/comment-section'
+import { usePalette } from '@/theme/palette'
+
+import { ArticleBody } from './article-body'
+import { ArticleMetaLine } from './article-meta-line'
+import { ArticleMore } from './article-more'
+import { useArticlePrint } from './article-print-host'
+import { BodyLoadingIndicator, useReservedBodyHeight } from './body-slot'
+import { ArticleAside } from './duo/article-aside'
+import { ArticleDuoFrame } from './duo/article-duo-frame'
+import { useDuoArticle } from './duo/reading-store'
+import { useCollapsingTitle } from './use-collapsing-title'
+
+export function PageDetailScreen({ slug }: { slug: string }) {
+  const router = useRouter()
+  const locale = useLocale()
+  const t = useTranslations('detail')
+  const tc = useTranslations('common')
+  const tl = useTranslations('list')
+  const tm = useTranslations('me')
+  const tp = useTranslations('print')
+  const owner = useOwner()
+  const { host: printHost, print } = useArticlePrint()
+  const palette = usePalette()
+  const scrollRef = useRef<ScrollViewInstance>(null)
+  const reservedBodyHeight = useReservedBodyHeight()
+
+  const query = useQuery({
+    queryFn: () => api.pageDetail(slug, locale),
+    queryKey: ['page', slug, locale],
+    staleTime: 5 * 60_000,
+  })
+  const page = query.data?.data
+  const enrichments = query.data?.enrichments ?? null
+  const webUrl = siteHref(`/${slug}`)
+  const webOnly = markdownOpensOnWeb(page?.contentFormat)
+  const body =
+    page?.contentFormat === 'lexical' && page.content ? page.content : null
+  const markdownSource =
+    page?.contentFormat === 'markdown' ? page.text : null
+  const markdown = useMemo(
+    () => (markdownSource ? markdownArticle(markdownSource) : null),
+    [markdownSource],
+  )
+  const headings = useMemo(
+    () => markdown?.headings ?? extractHeadings(body ?? ''),
+    [body, markdown],
+  )
+
+  useEffect(() => {
+    if (webOnly) void openExternalUrl(webUrl)
+  }, [webOnly, webUrl])
+
+  const duo = useDuoArticle()
+  const { headerTitleProgress, headerOptions, onScroll, onTitleLayout } =
+    useCollapsingTitle(page?.title, page?.subtitle ?? '', duo.onScrollMetrics)
+
+  const metaParts = page
+    ? [
+        formatRelativeTime(new Date(page.createdAt), locale),
+        page.text ? tl('wordCount', { count: page.text.length }) : null,
+      ]
+    : []
+
+  const scroll = (
+    children: ReactNode,
+    bottomInset?: number,
+    column: StyleProp<ViewStyle> = duoArticleColumn,
+  ) => (
+    <EdgeEffectScrollView
+      contentContainerStyle={[styles.content, column]}
+      contentInset={bottomInset ? { bottom: bottomInset } : undefined}
+      headerTitleProgress={headerTitleProgress}
+      ref={scrollRef}
+      style={[styles.screen, { backgroundColor: palette.surface.desk }]}
+      onScroll={onScroll}
+    >
+      {children}
+    </EdgeEffectScrollView>
+  )
+
+  return (
+    <View style={styles.screen}>
+      {printHost}
+      <Stack.Screen options={headerOptions} />
+      <ArticleMore
+        printAvailable={Boolean(body || markdown)}
+        title={page?.title}
+        tocAvailable={headings.length > 0 && !duo.asideShown}
+        url={webUrl}
+        onPrint={
+          page && (body || markdown)
+            ? () =>
+                print({
+                  category: tm('pages'),
+                  content: body ?? '',
+                  markdown,
+                  createdAt: new Date(page.createdAt),
+                  siteName: owner?.name || tp('site'),
+                  title: page.title,
+                  url: webUrl,
+                  variant: 'article',
+                })
+            : undefined
+        }
+        onToc={() => {
+          presentArticleToc(headings, Dimensions.get('window').height)
+          router.push(tocHref())
+        }}
+      />
+      {page ? (
+        <ArticleDuoFrame
+          asideAvailable={headings.length > 0}
+          aside={(mode) => (
+            <ArticleAside
+              headings={headings}
+              mode={mode}
+              reading={duo.reading}
+              title={page.title}
+              totalMinutes={estimateReadingMinutes(page.text?.length ?? 0)}
+            />
+          )}
+          onLayoutChange={duo.onLayoutChange}
+        >
+          {(column) => (
+            <CommentComposeHost
+              allowComment
+              refId={page.id}
+              refType="page"
+              scrollRef={scrollRef}
+            >
+              {(compose) =>
+                scroll(
+                  <>
+                    <View style={styles.header} onLayout={onTitleLayout}>
+                      <AppText variant="largeTitleSans">{page.title}</AppText>
+                      {page.subtitle ? (
+                        <AppText variant="secondary">{page.subtitle}</AppText>
+                      ) : null}
+                      <ArticleMetaLine parts={metaParts} />
+                    </View>
+                    {webOnly || (markdownSource && !markdown) ? (
+                      <View style={{ minHeight: reservedBodyHeight }}>
+                        <AppText
+                          style={styles.placeholder}
+                          variant="secondary"
+                          onPress={() => void openExternalUrl(webUrl)}
+                        >
+                          {tc('openInBrowser')}
+                        </AppText>
+                      </View>
+                    ) : body || markdown ? (
+                      <ArticleBody
+                        content={body ?? ''}
+                        enrichments={enrichments}
+                        markdown={markdown}
+                        refId={page.id}
+                        refType="page"
+                        scrollRef={scrollRef}
+                        variant="article"
+                        webUrl={webUrl}
+                      />
+                    ) : (
+                      <BodyLoadingIndicator minHeight={reservedBodyHeight} />
+                    )}
+                    <CommentSection refId={page.id} refType="page" />
+                  </>,
+                  compose.composing ? compose.scrollBottomInset : undefined,
+                  column,
+                )
+              }
+            </CommentComposeHost>
+          )}
+        </ArticleDuoFrame>
+      ) : (
+        scroll(
+          <AppText
+            style={styles.placeholder}
+            variant="secondary"
+            onPress={query.isError ? () => void query.refetch() : undefined}
+          >
+            {query.isError ? t('bodyFailed') : tc('loading')}
+          </AppText>,
+        )
+      )}
+    </View>
+  )
+}
+
+const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+  },
+  content: {
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 48,
+    gap: 20,
+  },
+  header: {
+    gap: 8,
+  },
+  placeholder: {
+    marginTop: 32,
+    textAlign: 'center',
+  },
+})
